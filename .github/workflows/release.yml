@@ -12,6 +12,10 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
@@ -23,11 +27,11 @@ jobs:
 
       - name: Build
         run: |
-          go build -o hydra main.go
+          GOARCH=${{ matrix.goarch }} go build -o hydra-${{ matrix.goarch }} main.go
 
       - name: Archive binary
         run: |
-          tar -czvf hydra.tar.gz hydra
+          tar -czvf hydra-${{ matrix.goarch }}.tar.gz hydra-${{ matrix.goarch }}
 
       - name: Create Release
         id: create_release
@@ -46,6 +50,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./hydra.tar.gz
-          asset_name: hydra.tar.gz
+          asset_path: ./hydra-${{ matrix.goarch }}.tar.gz
+          asset_name: hydra-${{ matrix.goarch }}.tar.gz
           asset_content_type: application/gzip
