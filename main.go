@@ -1,32 +1,35 @@
 package main
 
 import (
-	"flag"
+	"bufio"
+	"context"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"time"
 
-	"github.com/ddollar/ddl"
+	"github.com/ddollar/hydra/pkg/api"
+	"github.com/ddollar/hydra/pkg/config"
+	"github.com/ddollar/hydra/pkg/wan"
 	"github.com/ddollar/logger"
-	probing "github.com/prometheus-community/pro-bing"
-	"github.com/vishvananda/netlink"
+	"go.bug.st/serial"
 )
 
-var active string
-var healthcheck string
-var interval time.Duration
+// var active string
+// var healthcheck string
+// var interval time.Duration
 
 func main() {
-	flag.DurationVar(&interval, "i", 15*time.Second, "check interval")
-	flag.StringVar(&healthcheck, "h", "1.1.1.1", "healthcheck address")
-	flag.Parse()
+	// flag.DurationVar(&interval, "i", 15*time.Second, "check interval")
+	// flag.StringVar(&healthcheck, "h", "1.1.1.1", "healthcheck address")
+	// flag.Parse()
 
-	if len(flag.Args()) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: hydra <interface>...\n")
-		os.Exit(1)
-	}
+	// if len(flag.Args()) < 2 {
+	// 	fmt.Fprintf(os.Stderr, "usage: hydra <interface>...\n")
+	// 	os.Exit(1)
+	// }
 
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %s\n", err)
@@ -35,162 +38,171 @@ func main() {
 }
 
 func run() error {
-	interfaces := flag.Args()
+	ctx := context.Background()
 
-	log := logger.New("ns=hydra")
-	log.Logf("interfaces=%v", interfaces)
-
-	check(log, interfaces)
-
-	t := time.NewTicker(interval)
-	defer t.Stop()
-
-	for range t.C {
-		check(log, interfaces)
+	cfg, err := config.Load("/etc/hydra.yml")
+	if err != nil {
+		return err
 	}
+
+	w, err := runWan(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	if err := runApi(ctx, w, cfg); err != nil {
+		return err
+	}
+
+	select {}
+}
+
+func runApi(ctx context.Context, w *wan.Wan, cfg *config.Config) error {
+	qhs, err := qualityHandlers(cfg)
+	if err != nil {
+		return err
+	}
+
+	a := api.New(w, qhs)
+
+	go a.Listen(ctx, "https", ":3000")
 
 	return nil
 }
 
-func check(log *logger.Logger, interfaces []string) {
-	for _, iface := range interfaces {
-		log := log.Append("interface=%s", iface)
+func runWan(ctx context.Context, cfg *config.Config) (*wan.Wan, error) {
+	interfaces := make([]string, len(cfg.Interfaces))
 
-		c, err := connected(log, iface)
+	for i := range cfg.Interfaces {
+		interfaces[i] = cfg.Interfaces[i].Device
+	}
+
+	w := wan.New(interfaces)
+
+	w.Healthcheck = cfg.Healthcheck
+	w.Interval = cfg.Interval
+
+	go w.Watch(logger.New("ns=hydra").WithContext(ctx))
+
+	return w, nil
+}
+
+func qualityHandlers(cfg *config.Config) (api.QualityHandlers, error) {
+	qhs := api.QualityHandlers{}
+
+	for _, i := range cfg.Interfaces {
+		qh, err := qualityHandler(i)
 		if err != nil {
-			_ = log.Error(err)
-			continue
-		}
-		if !c {
-			log.Logf("status=down")
+			return nil, err
 		}
 
-		if c {
-			if iface != active {
-				log.Logf("active")
+		qhs[i.Device] = qh
+	}
 
-				for _, target := range interfaces {
-					if err := setMetric(target, ddl.If(target == iface, 100, 101)); err != nil {
-						log.Error(err)
+	return qhs, nil
+}
+
+func qualityHandler(ci config.Interface) (api.QualityHandler, error) {
+	switch ci.Type {
+	case "gprs":
+		return gprsQualityHandler(ci), nil
+	case "starlink":
+		return starlinkQualityHandler(ci), nil
+	case "wifi":
+		return wifiQualityHandler(ci), nil
+	default:
+		return nil, fmt.Errorf("unknown device type: %s", ci.Type)
+	}
+}
+
+var reMobileSignalStrength = regexp.MustCompile(`\+CSQ:\s*(\d+),\s*(\d+)`)
+
+func gprsQualityHandler(ci config.Interface) api.QualityHandler {
+	return func() (int, error) {
+		if ci.Check == "" {
+			return 0, fmt.Errorf("check required for gprs")
+		}
+
+		s, err := serial.Open(ci.Check, &serial.Mode{
+			BaudRate: 115200,
+			Parity:   serial.NoParity,
+			DataBits: 8,
+			StopBits: serial.OneStopBit,
+		})
+		if err != nil {
+			return 0, err
+		}
+		defer s.Close()
+
+		if _, err := s.Write([]byte("AT+CSQ\r")); err != nil {
+			return 0, err
+		}
+
+		csq := make(chan int)
+		ta := time.After(3 * time.Second)
+
+		go func() {
+			scanner := bufio.NewScanner(s)
+
+			for scanner.Scan() {
+				m := reMobileSignalStrength.FindStringSubmatch(scanner.Text())
+
+				if len(m) > 2 {
+					dbm, err := strconv.Atoi(m[1])
+					if err != nil {
+						csq <- -1
 					}
+					csq <- dbmToPercentage(dbm)
 				}
-
-				active = iface
 			}
+		}()
 
-			break
+		select {
+		case <-ta:
+			return 0, fmt.Errorf("timeout")
+		case dbm := <-csq:
+			return dbm, nil
 		}
 	}
 }
 
-func setMetric(iface string, priority int) error {
-	ifc, err := net.InterfaceByName(iface)
-	if err != nil {
-		return err
+func starlinkQualityHandler(ci config.Interface) api.QualityHandler {
+	return func() (int, error) {
+		return 0, nil
 	}
-
-	_, ipn, err := net.ParseCIDR("0.0.0.0/0")
-	if err != nil {
-		return err
-	}
-
-	filter := &netlink.Route{
-		LinkIndex: ifc.Index,
-		Dst:       ipn,
-	}
-
-	rs, err := netlink.RouteListFiltered(netlink.FAMILY_ALL, filter, netlink.RT_FILTER_OIF|netlink.RT_FILTER_DST)
-	if err != nil {
-		return err
-	}
-	if len(rs) == 0 {
-		return nil
-	}
-	if len(rs) > 1 {
-		return fmt.Errorf("can not handle multiple default routes for interface: %s", iface)
-	}
-
-	r := rs[0]
-
-	if err := shell("route", "del", "default", "dev", iface, "gw", r.Gw.String(), "metric", fmt.Sprintf("%d", r.Priority)); err != nil {
-		return err
-	}
-
-	if err := shell("route", "add", "default", "dev", iface, "gw", r.Gw.String(), "metric", fmt.Sprintf("%d", priority)); err != nil {
-		return err
-	}
-
-	if err := shell("ip", "route", "flush", "cache"); err != nil {
-		return err
-	}
-
-	return nil
 }
 
-func connected(log *logger.Logger, iface string) (bool, error) {
-	ifc, err := net.InterfaceByName(iface)
-	if err != nil {
-		return false, err
-	}
+var reWlanSignalStrength = regexp.MustCompile(`signal:\s*(-?\d+)`)
 
-	if ifc.Flags&net.FlagUp == 0 {
-		return false, nil
-	}
-
-	p, err := pinger(iface)
-	if err != nil {
-		return false, err
-	}
-
-	if err := p.Run(); err != nil {
-		return false, err
-	}
-
-	if p.Statistics().PacketsRecv == 0 {
-		return false, nil
-	}
-
-	log.Logf("status=up rtt=%dms", p.Statistics().AvgRtt.Milliseconds())
-
-	return true, nil
-}
-
-func address(ifc *net.Interface) (string, error) {
-	as, err := ifc.Addrs()
-	if err != nil {
-		return "", err
-	}
-
-	if len(as) < 1 {
-		return "", nil
-	}
-
-	for _, a := range as {
-		if ip, ok := a.(*net.IPNet); ok && ip.IP.To4() != nil {
-			return ip.IP.String(), nil
+func wifiQualityHandler(ci config.Interface) api.QualityHandler {
+	return func() (int, error) {
+		data, err := exec.Command("iw", "dev", ci.Device, "link").CombinedOutput()
+		if err != nil {
+			return 0, err
 		}
-	}
 
-	return "", nil
+		m := reWlanSignalStrength.FindStringSubmatch(string(data))
+		if len(m) < 2 {
+			return 0, fmt.Errorf("signal strength not found")
+		}
+
+		ss, err := strconv.Atoi(m[1])
+		if err != nil {
+			return 0, err
+		}
+
+		return dbmToPercentage(ss), nil
+	}
 }
 
-func pinger(iface string) (*probing.Pinger, error) {
-	p, err := probing.NewPinger(healthcheck)
-	if err != nil {
-		return nil, err
+func dbmToPercentage(dBm int) int {
+	if dBm <= -100 {
+		return 0
 	}
 
-	p.SetPrivileged(true)
+	if dBm >= -50 {
+		return 100
+	}
 
-	p.InterfaceName = iface
-	p.Count = 5
-	p.TTL = 64
-	p.Interval = 100 * time.Millisecond
-	p.Timeout = 1 * time.Second
-
-	return p, nil
-}
-
-func shell(cmd string, args ...string) error {
-	return exec.Command(cmd, args...).Run()
+	return 2 * (dBm + 100)
 }
