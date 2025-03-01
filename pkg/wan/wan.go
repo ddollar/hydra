@@ -166,13 +166,11 @@ func setMetric(iface string, priority int) error {
 		return err
 	}
 
-	if err := shell("systemctl", "restart", "wg-quick@wg0"); err != nil {
+	if err := shell("ip", "route", "flush", "cache"); err != nil {
 		return err
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	if err := shell("ip", "route", "flush", "cache"); err != nil {
+	if err := shell("systemctl", "restart", "wg-quick@wg0"); err != nil {
 		return err
 	}
 
