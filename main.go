@@ -118,6 +118,42 @@ func qualityHandler(ci config.Interface) (api.QualityHandler, error) {
 
 var reMobileSignalStrength = regexp.MustCompile(`\+CSQ:\s*(\d+),\s*(\d+)`)
 
+var dbmTable = map[string]int{
+	"0":  -113,
+	"1":  -111,
+	"2":  -109,
+	"3":  -107,
+	"4":  -105,
+	"5":  -103,
+	"6":  -101,
+	"7":  -99,
+	"8":  -97,
+	"9":  -95,
+	"10": -93,
+	"11": -91,
+	"12": -89,
+	"13": -87,
+	"14": -85,
+	"15": -83,
+	"16": -81,
+	"17": -79,
+	"18": -77,
+	"19": -75,
+	"20": -73,
+	"21": -71,
+	"22": -69,
+	"23": -67,
+	"24": -65,
+	"25": -63,
+	"26": -61,
+	"27": -59,
+	"28": -57,
+	"29": -55,
+	"30": -53,
+	"31": -51,
+	"99": -113, // not known or not detectable
+}
+
 func gprsQualityHandler(ci config.Interface) api.QualityHandler {
 	return func() (int, error) {
 		if ci.Check == "" {
@@ -139,7 +175,7 @@ func gprsQualityHandler(ci config.Interface) api.QualityHandler {
 			return 0, err
 		}
 
-		csq := make(chan int)
+		csq := make(chan string)
 		ta := time.After(3 * time.Second)
 
 		go func() {
@@ -149,11 +185,7 @@ func gprsQualityHandler(ci config.Interface) api.QualityHandler {
 				m := reMobileSignalStrength.FindStringSubmatch(scanner.Text())
 
 				if len(m) > 2 {
-					dbm, err := strconv.Atoi(m[1])
-					if err != nil {
-						csq <- -1
-					}
-					csq <- dbmToPercentage(dbm)
+					csq <- m[1]
 				}
 			}
 		}()
@@ -161,8 +193,11 @@ func gprsQualityHandler(ci config.Interface) api.QualityHandler {
 		select {
 		case <-ta:
 			return 0, fmt.Errorf("timeout")
-		case dbm := <-csq:
-			return dbm, nil
+		case id := <-csq:
+			if dbm, ok := dbmTable[id]; ok {
+				return dbmToPercentage(dbm), nil
+			}
+			return 0, nil
 		}
 	}
 }
