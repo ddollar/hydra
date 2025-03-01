@@ -116,7 +116,7 @@ func (w *Wan) pinger(iface string) (*probing.Pinger, error) {
 	p.Count = 5
 	p.TTL = 64
 	p.Interval = 100 * time.Millisecond
-	p.Timeout = 1 * time.Second
+	p.Timeout = 5 * time.Second
 
 	return p, nil
 }
