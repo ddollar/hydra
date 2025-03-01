@@ -17,12 +17,16 @@ type Wan struct {
 	Healthcheck string
 	Interfaces  []string
 	Interval    time.Duration
+	Timeout     time.Duration
 	active      string
 }
 
 func New(interfaces []string) *Wan {
 	return &Wan{
-		Interfaces: interfaces,
+		Interfaces:  interfaces,
+		Healthcheck: "1.1.1.1",
+		Interval:    15 * time.Second,
+		Timeout:     5 * time.Second,
 	}
 }
 
@@ -116,7 +120,7 @@ func (w *Wan) pinger(iface string) (*probing.Pinger, error) {
 	p.Count = 5
 	p.TTL = 64
 	p.Interval = 100 * time.Millisecond
-	p.Timeout = 5 * time.Second
+	p.Timeout = w.Timeout
 
 	return p, nil
 }
@@ -161,6 +165,8 @@ func setMetric(iface string, priority int) error {
 	if err := shell("route", "add", "default", "dev", iface, "gw", r.Gw.String(), "metric", fmt.Sprintf("%d", priority)); err != nil {
 		return err
 	}
+
+	time.Sleep(100 * time.Millisecond)
 
 	if err := shell("ip", "route", "flush", "cache"); err != nil {
 		return err

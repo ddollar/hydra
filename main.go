@@ -81,6 +81,7 @@ func runWan(ctx context.Context, cfg *config.Config) (*wan.Wan, error) {
 
 	w.Healthcheck = cfg.Healthcheck
 	w.Interval = cfg.Interval
+	w.Timeout = cfg.Timeout
 
 	go w.Watch(logger.New("ns=hydra").WithContext(ctx))
 

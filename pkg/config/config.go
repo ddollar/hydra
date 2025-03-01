@@ -12,6 +12,7 @@ type Config struct {
 	Healthcheck string
 	Interval    time.Duration
 	Interfaces  []Interface
+	Timeout     time.Duration
 }
 
 type Interface struct {
@@ -40,6 +41,18 @@ func Load(path string) (*Config, error) {
 		if i.Type == "" {
 			return nil, fmt.Errorf("type is required")
 		}
+	}
+
+	if cfg.Healthcheck == "" {
+		cfg.Healthcheck = "1.1.1.1"
+	}
+
+	if cfg.Interval == 0 {
+		cfg.Interval = 15 * time.Second
+	}
+
+	if cfg.Timeout == 0 {
+		cfg.Timeout = 5 * time.Second
 	}
 
 	return &cfg, nil
